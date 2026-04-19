@@ -33,6 +33,3 @@ The output video will be saved as `bert_training.mp4` in the project directory.
 - tqdm
 
 All dependencies are managed via `pixi.toml` for cross-platform reproducibility (Linux, macOS, Windows).
-
-## License
-MIT
