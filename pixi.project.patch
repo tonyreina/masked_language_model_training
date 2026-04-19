@@ -1,0 +1,5 @@
+# Add tqdm for progress bar in animation rendering
+[project]
+dependencies = [
+  "tqdm"
+]
