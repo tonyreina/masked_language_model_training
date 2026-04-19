@@ -1,13 +1,10 @@
 """
 Render BERT masked-training animation to MP4.
 
-Design goals:
-- 1920x1080, 24fps, ~40 seconds total.
-- Dark presentation-ready styling matching the widget.
-- Per-epoch sentences; every 4th epoch is the benchmark "milk" sentence.
-- Points migrate from random scatter to cluster positions with easeOut.
-- Star marker follows the current sentence's target word.
-- Loss, guess, epoch pill update each frame.
+Two-phase per epoch:
+  Phase 1 (game-show) — context words light up one by one; top-5 probability
+                        bar chart narrows in real time as each clue appears.
+  Phase 2 (embed)     — cut to embedding space; star pulses on the winner.
 """
 
 import math
@@ -21,7 +18,7 @@ from matplotlib.patches import FancyBboxPatch, Rectangle, Polygon
 import numpy as np
 from tqdm import tqdm
 
-# ---------- palette ----------
+# ── palette ──────────────────────────────────────────────────────────────
 BG        = "#0F121C"
 PANEL     = "#1A1F2E"
 PANEL_LT  = "#22293B"
@@ -33,6 +30,7 @@ ACCENT    = "#FAC775"
 ACCENT_DK = "#854F0B"
 MASK_BG   = "#3A2E14"
 MASK_FG   = "#FAC775"
+BAR_DIM   = "#2A3045"
 
 CLUSTER_COLORS = {
     "drinks":  "#378ADD",
@@ -43,54 +41,55 @@ CLUSTER_COLORS = {
     "weather": "#C1D453",
 }
 
-# ---------- layout / render ----------
-FIG_W, FIG_H   = 19.2, 10.8   # inches at 100 dpi → 1920×1080
+# ── layout / render ───────────────────────────────────────────────────────
+FIG_W, FIG_H   = 19.2, 10.8
 DPI            = 100
-CANVAS_W       = 9.0           # embedding-space data units
+CANVAS_W       = 9.0
 CANVAS_H       = 4.4
 
-# Embedding-space axes position within the figure (fraction)
 AX_LEFT, AX_BOTTOM, AX_W, AX_H = 0.40, 0.18, 0.55, 0.68
 
-# y data-units map to more screen pixels than x data-units, so a star drawn
-# with equal radii appears vertically stretched.  Scale x radii to compensate.
 _STAR_X_SCALE = (FIG_H * AX_H / CANVAS_H) / (FIG_W * AX_W / CANVAS_W)
 
-# Sentence card layout constants (axes-fraction coordinates)
 LEFT        = 0.05
 RIGHT_LIMIT = 0.95
 LINE1_Y     = 0.70
 LINE2_Y     = 0.52
 
-# ---------- timing ----------
+# ── timing ────────────────────────────────────────────────────────────────
 FPS               = 24
-HOLD_FRAMES       = 32   # ~1.3 s per epoch
-TRANSITION_FRAMES = 22   # ~0.9 s transition
-INITIAL_PAUSE     = 30   # frames before first epoch
-FINAL_HOLD        = 40   # extra frames at the end
+GAMESHOW_FRAMES   = 126  # phase-1 per epoch: word reveal + bar chart  (42 × 3)
+EMBED_FRAMES      = 54   # phase-2 per epoch: embedding space focus     (18 × 3)
+TRANSITION_FRAMES = 66   # dot migration between epochs                 (22 × 3)
+INITIAL_PAUSE     = 90
+FINAL_HOLD        = 120
 
-# ---------- halo / label fade ----------
-HALO_FADE_START  = 0.55   # global_t at which cluster halos begin to appear
+# ── halo / label fade ─────────────────────────────────────────────────────
+HALO_FADE_START  = 0.55
 HALO_FADE_RANGE  = 0.45
 HALO_MAX_ALPHA   = 0.12
 LABEL_ALPHA_MIN  = 0.4
 LABEL_ALPHA_SPAN = 0.6
 
-# ---------- font sizes ----------
-FS_TITLE          = 30   # main header
-FS_SUBTITLE       = 16   # header subtitle
-FS_PANEL_LABEL    = 18   # small section labels ("EMBEDDING SPACE", "SEMANTIC CLUSTERS")
-FS_CARD_LABEL     = 18   # card section labels ("TRAINING EXAMPLE", "WHAT'S HAPPENING")
-FS_EPOCH_PILL     = 13   # epoch pill
-FS_SENTENCE       = 17   # sentence tokens
-FS_CHIP           = 15   # [MASK] → guess chip
-FS_GUESS_LINE     = 12   # loss / guess label below sentence
-FS_LEGEND_ITEM    = 18   # legend cluster names
-FS_NARRATION      = 16   # narration body text
-FS_DOT_LABEL      = 18   # word labels in the embedding space
-FS_CLUSTER_MAP    = 14   # cluster names overlaid on the map
+# ── font sizes ────────────────────────────────────────────────────────────
+FS_TITLE          = 30
+FS_SUBTITLE       = 16
+FS_PANEL_LABEL    = 18
+FS_CARD_LABEL     = 18
+FS_EPOCH_PILL     = 13
+FS_SENTENCE       = 17
+FS_CHIP           = 15
+FS_GUESS_LINE     = 12
+FS_LEGEND_ITEM    = 18
+FS_NARRATION      = 16
+FS_DOT_LABEL      = 18
+FS_CLUSTER_MAP    = 14
+FS_GS_SENTENCE    = 15   # monospace reveal sentence
+FS_GS_LABEL       = 13   # "FILL IN THE BLANK" sublabel
+FS_BAR_WORD       = 13   # candidate word labels
+FS_BAR_VAL        = 11   # probability percentages
 
-# ---------- dataclasses ----------
+# ── dataclasses ───────────────────────────────────────────────────────────
 @dataclass
 class Cluster:
     id: str
@@ -109,7 +108,7 @@ class Epoch:
     guess: str = ""
     loss: float = 0.0
 
-# ---------- static data ----------
+# ── static data ───────────────────────────────────────────────────────────
 CLUSTERS: list[Cluster] = [
     Cluster("drinks",  "Drinks",  1.8, 1.2, ["milk","coffee","tea","juice","water","wine"]),
     Cluster("food",    "Food",    1.8, 3.2, ["bread","apple","pasta","cheese","rice","cake"]),
@@ -143,7 +142,32 @@ _BENCH_PROGRESSION: list[tuple[str, float]] = [
     ("milk",   0.25),
 ]
 
-# ---------- epoch construction ----------
+# ── math helpers (defined early; needed for bar-snapshot generation) ───────
+def ease_in_out(t: float) -> float:
+    return 3*t*t - 2*t*t*t
+
+def interp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+def stitch(tokens: list[str]) -> str:
+    out = ""
+    for t in tokens:
+        if t in (".", ","):
+            out = out.rstrip() + t
+        else:
+            out += t + " "
+    return out
+
+def star_vertices(cx: float, cy: float, r_outer: float, r_inner: float, n: int = 5):
+    verts = []
+    for i in range(2 * n):
+        angle = -math.pi / 2 + i * math.pi / n
+        r = r_outer if i % 2 == 0 else r_inner
+        verts.append((cx + r * _STAR_X_SCALE * math.cos(angle),
+                      cy + r * math.sin(angle)))
+    return verts
+
+# ── epoch construction ────────────────────────────────────────────────────
 def _other_guess_loss(truth: str, epoch_num: int) -> tuple[str, float]:
     rng = random.Random(epoch_num)
     if epoch_num < 20:
@@ -183,9 +207,57 @@ def _build_epochs() -> list[Epoch]:
 
 EPOCHS = _build_epochs()
 
-# ---------- per-word start/end positions ----------
-rng_master = random.Random(42)
+# ── bar-chart snapshot data ───────────────────────────────────────────────
+N_BAR_STEPS = 5   # probability snapshots across the game-show reveal
 
+def _build_bar_snapshots(ep: Epoch) -> list[list[tuple[str, float]]]:
+    """N_BAR_STEPS snapshots, each a fixed-order list of (word, prob) pairs.
+    Slot 0 is always the model's guess; it ends up dominant."""
+    guess       = ep.guess
+    guess_clust = _CLUSTER_BY_WORD.get(guess)
+    rng         = random.Random(ep.epoch * 31 + 7)
+
+    if guess_clust is not None:
+        same        = [w for w in guess_clust.words if w != guess]
+        competitors = rng.sample(same, min(2, len(same)))
+    else:
+        competitors = []
+
+    outsider_pool = [
+        w for c in CLUSTERS
+        if guess_clust is None or c.id != guess_clust.id
+        for w in c.words
+    ]
+    n_out     = max(0, 4 - len(competitors))
+    outsiders = rng.sample(outsider_pool, min(n_out, len(outsider_pool)))
+
+    words = ([guess] + competitors + outsiders)[:5]
+    while len(words) < 5:
+        words.append(words[-1])
+
+    snapshots = []
+    for step in range(N_BAR_STEPS):
+        t       = step / (N_BAR_STEPS - 1)
+        eased   = ease_in_out(t)
+        guess_p = 0.14 + 0.66 * eased
+        rem     = 1.0 - guess_p
+
+        raw = {guess: guess_p}
+        others = [w for w in words if w != guess]
+        for i, w in enumerate(others):
+            raw[w] = rem * max(0.04, 1.0 - i * 0.28)
+
+        total = sum(raw.values())
+        snapshots.append([(w, raw[w] / total) for w in words])
+
+    return snapshots
+
+EPOCH_BARS: list[list[list[tuple[str, float]]]] = [
+    _build_bar_snapshots(ep) for ep in EPOCHS
+]
+
+# ── per-word start/end positions ──────────────────────────────────────────
+rng_master = random.Random(42)
 all_points: list[dict] = []
 for c in CLUSTERS:
     for w in c.words:
@@ -198,40 +270,14 @@ for c in CLUSTERS:
         all_points.append({"word": w, "cluster": c.id, "color": CLUSTER_COLORS[c.id],
                             "start": start, "end": end})
 
-# ---------- helper functions ----------
-def stitch(tokens: list[str]) -> str:
-    """Join tokens, gluing punctuation without a leading space."""
-    out = ""
-    for t in tokens:
-        if t == ".":
-            out = out.rstrip() + "."
-        else:
-            out += t + " "
-    return out
-
-def ease_in_out(t: float) -> float:
-    return 3*t*t - 2*t*t*t
-
-def interp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
-
-def star_vertices(cx: float, cy: float, r_outer: float, r_inner: float, n: int = 5) -> list[tuple]:
-    """Return vertices of a 5-pointed star corrected for axes aspect ratio."""
-    verts = []
-    for i in range(2 * n):
-        angle = -math.pi / 2 + i * math.pi / n
-        r = r_outer if i % 2 == 0 else r_inner
-        verts.append((cx + r * _STAR_X_SCALE * math.cos(angle),
-                      cy + r * math.sin(angle)))
-    return verts
-
-# ---------- figure setup ----------
+# ── figure setup ──────────────────────────────────────────────────────────
 fig = plt.figure(figsize=(FIG_W, FIG_H), dpi=DPI, facecolor=BG)
 
+# Embedding-space axes (right panel, always visible)
 ax_space = fig.add_axes([AX_LEFT, AX_BOTTOM, AX_W, AX_H])
 ax_space.set_facecolor(PANEL)
 ax_space.set_xlim(0, CANVAS_W)
-ax_space.set_ylim(CANVAS_H, 0)   # flipped: y increases downward
+ax_space.set_ylim(CANVAS_H, 0)
 ax_space.set_xticks([]); ax_space.set_yticks([])
 for spine in ax_space.spines.values():
     spine.set_color(BORDER); spine.set_linewidth(0.5)
@@ -255,7 +301,7 @@ pill_ax.add_patch(pill_patch)
 pill_text = pill_ax.text(0.5, 0.5, "Epoch 0", ha="center", va="center",
                          color=TEXT_MUTE, fontsize=FS_EPOCH_PILL, family="DejaVu Sans")
 
-# Sentence card
+# ── sentence card ─────────────────────────────────────────────────────────
 sent_ax = fig.add_axes([0.04, 0.58, 0.33, 0.30])
 sent_ax.set_xlim(0, 1); sent_ax.set_ylim(0, 1); sent_ax.axis("off")
 sent_ax.add_patch(FancyBboxPatch(
@@ -264,9 +310,13 @@ sent_ax.add_patch(FancyBboxPatch(
     linewidth=0.5, edgecolor=BORDER, facecolor=PANEL,
 ))
 sent_ax.add_patch(Rectangle((0.0, 0.0), 0.018, 1.0, facecolor=ACCENT, edgecolor="none"))
-sent_ax.text(0.05, 0.88, "TRAINING EXAMPLE", color=TEXT_DIM, fontsize=FS_CARD_LABEL,
-             weight="bold", family="DejaVu Sans", transform=sent_ax.transAxes)
 
+# Embed-phase title (shown during embed / transition)
+sent_title = sent_ax.text(0.05, 0.88, "TRAINING EXAMPLE", color=TEXT_DIM,
+                          fontsize=FS_CARD_LABEL, weight="bold", family="DejaVu Sans",
+                          transform=sent_ax.transAxes)
+
+# Embed-phase sentence artists
 sentence_text = sent_ax.text(
     LEFT, LINE1_Y, "", color=TEXT, fontsize=FS_SENTENCE, family="DejaVu Sans",
     transform=sent_ax.transAxes, va="center", ha="left",
@@ -290,7 +340,19 @@ post_line2 = sent_ax.text(LEFT, LINE2_Y, "", color=TEXT, fontsize=FS_SENTENCE,
 guess_text = sent_ax.text(0.05, 0.12, "", color=TEXT_MUTE, fontsize=FS_GUESS_LINE,
                           family="DejaVu Sans", transform=sent_ax.transAxes)
 
-# Legend
+# Game-show phase sentence artists
+gs_sublabel = sent_ax.text(0.05, 0.88, "FILL IN THE BLANK", color=TEXT_DIM,
+                            fontsize=FS_GS_LABEL, weight="bold", family="DejaVu Sans",
+                            transform=sent_ax.transAxes, visible=False)
+gs_sentence = sent_ax.text(0.05, 0.55, "", color=TEXT, fontsize=FS_GS_SENTENCE,
+                            family="DejaVu Sans Mono", transform=sent_ax.transAxes,
+                            va="center", visible=False)
+# [?] mask indicator shown separately so it can be accent-coloured
+gs_mask_word = sent_ax.text(0.05, 0.28, "predict →  [  ?  ]", color=ACCENT,
+                             fontsize=FS_GS_LABEL, weight="bold", family="DejaVu Sans Mono",
+                             transform=sent_ax.transAxes, va="center", visible=False)
+
+# ── legend ────────────────────────────────────────────────────────────────
 leg_ax = fig.add_axes([0.04, 0.44, 0.33, 0.11])
 leg_ax.set_xlim(0, 1); leg_ax.set_ylim(0, 1); leg_ax.axis("off")
 leg_ax.text(0, 0.92, "SEMANTIC CLUSTERS", color=TEXT_DIM, fontsize=FS_PANEL_LABEL,
@@ -303,7 +365,7 @@ for i, c in enumerate(CLUSTERS):
     leg_ax.text(lx + 0.03, ly, c.label, color=TEXT, fontsize=FS_LEGEND_ITEM,
                 family="DejaVu Sans", va="center")
 
-# Narration panel
+# ── narration panel (embed / transition phases only) ──────────────────────
 narr_ax = fig.add_axes([0.04, 0.20, 0.33, 0.21])
 narr_ax.set_xlim(0, 1); narr_ax.set_ylim(0, 1); narr_ax.axis("off")
 narr_ax.add_patch(FancyBboxPatch(
@@ -317,7 +379,43 @@ narr_text = narr_ax.text(0.05, 0.60, "", color=TEXT, fontsize=FS_NARRATION,
                          family="DejaVu Sans", transform=narr_ax.transAxes,
                          va="top", wrap=True)
 
-# ---------- embedding space artists ----------
+# ── probability bar chart (game-show phase only) ──────────────────────────
+# Positioned to replace the narration panel during game-show
+ax_bar = fig.add_axes([0.04, 0.17, 0.33, 0.24])
+ax_bar.set_facecolor(PANEL_LT)
+ax_bar.set_xlim(0, 1)
+ax_bar.set_ylim(-0.5, 4.5)
+ax_bar.set_xticks([]); ax_bar.set_yticks([])
+for spine in ax_bar.spines.values():
+    spine.set_color(BORDER); spine.set_linewidth(0.5)
+ax_bar.text(0.04, 4.15, "TOP CANDIDATES", color=TEXT_DIM,
+            fontsize=FS_CARD_LABEL, weight="bold", family="DejaVu Sans")
+
+# 5 bar slots; slot 0 = top (guess word)
+_BAR_SLOTS_Y   = [3.35, 2.55, 1.75, 0.95, 0.15]
+_BAR_HEIGHT    = 0.52
+_BAR_LEFT      = 0.24   # x data-coord where bars start
+_BAR_MAX_W     = 0.72   # maximum bar width in data-coords
+
+_bar_rects : list[Rectangle] = []
+_bar_words : list            = []
+_bar_vals  : list            = []
+
+for slot, y in enumerate(_BAR_SLOTS_Y):
+    rect = Rectangle((_BAR_LEFT, y - _BAR_HEIGHT / 2), 0.0, _BAR_HEIGHT,
+                     facecolor=BAR_DIM, edgecolor="none", zorder=2)
+    ax_bar.add_patch(rect)
+    _bar_rects.append(rect)
+    _bar_words.append(ax_bar.text(
+        _BAR_LEFT - 0.03, y, "", color=TEXT_MUTE, fontsize=FS_BAR_WORD,
+        family="DejaVu Sans", ha="right", va="center"))
+    _bar_vals.append(ax_bar.text(
+        _BAR_LEFT + _BAR_MAX_W + 0.02, y, "", color=TEXT_MUTE, fontsize=FS_BAR_VAL,
+        family="DejaVu Sans", ha="left", va="center"))
+
+ax_bar.set_visible(False)   # hidden until game-show phase
+
+# ── embedding-space artists ───────────────────────────────────────────────
 cluster_halos: list[tuple] = []
 for c in CLUSTERS:
     halo = mpatches.Ellipse(
@@ -352,37 +450,53 @@ for c in CLUSTERS:
         family="DejaVu Sans", ha="center", alpha=0.0, zorder=2,
     ))
 
-# ---------- timeline ----------
-TOTAL_FRAMES = INITIAL_PAUSE + FINAL_HOLD + sum(
-    HOLD_FRAMES + (TRANSITION_FRAMES if i > 0 else 0)
-    for i in range(len(EPOCHS))
+# ── timeline ──────────────────────────────────────────────────────────────
+TOTAL_FRAMES = (
+    INITIAL_PAUSE
+    + FINAL_HOLD
+    + len(EPOCHS) * (GAMESHOW_FRAMES + EMBED_FRAMES)
+    + (len(EPOCHS) - 1) * TRANSITION_FRAMES
 )
 
 def frame_to_state(frame: int) -> tuple[int, float, float, str]:
-    """Return (epoch_idx, transition_alpha, global_t, phase)."""
+    """Return (epoch_idx, phase_frac, global_t, phase).
+
+    phase_frac  — 0..1 within the current phase
+    phase       — 'gameshow' | 'embed' | 'transition'
+    global_t    — 0..1 across the whole animation (drives dot positions)
+    """
     f = frame - INITIAL_PAUSE
-    if f < 0:
-        return 0, 0.0, 0.0, "hold"
     n = len(EPOCHS)
+    if f < 0:
+        return 0, 0.0, 0.0, "gameshow"
+
     for i in range(n):
         if i > 0:
             if f < TRANSITION_FRAMES:
                 alpha = f / TRANSITION_FRAMES
-                return i, alpha, (i - 1 + alpha) / (n - 1), "transition"
+                g_t   = ((i - 1) + alpha) / (n - 1)
+                return i, alpha, g_t, "transition"
             f -= TRANSITION_FRAMES
-        if f < HOLD_FRAMES:
-            return i, 1.0, i / (n - 1), "hold"
-        f -= HOLD_FRAMES
-    return n - 1, 1.0, 1.0, "hold"
 
-# ---------- draw helpers ----------
+        if f < GAMESHOW_FRAMES:
+            g_t = i / (n - 1) if n > 1 else 1.0
+            return i, f / GAMESHOW_FRAMES, g_t, "gameshow"
+        f -= GAMESHOW_FRAMES
+
+        if f < EMBED_FRAMES:
+            g_t = i / (n - 1) if n > 1 else 1.0
+            return i, f / EMBED_FRAMES, g_t, "embed"
+        f -= EMBED_FRAMES
+
+    return n - 1, 1.0, 1.0, "embed"
+
+# ── draw helpers ──────────────────────────────────────────────────────────
 def _finalize_guess_label(ep: Epoch) -> None:
     prefix = "★ Benchmark — loss: " if ep.is_bench else "Loss: "
     guess_text.set_text(f"{prefix}{ep.loss:.2f}")
     guess_text.set_color(ACCENT if ep.is_bench else TEXT_MUTE)
 
 def _place_chip(renderer, inv, chip_str: str, chip_left: float) -> float:
-    """Position chip_text and return its right edge in axes fraction."""
     chip_text.set_text(chip_str)
     chip_text.set_position((chip_left + 0.012, LINE1_Y))
     bbox = chip_text.get_window_extent(renderer=renderer)
@@ -430,10 +544,9 @@ def draw_sentence(ep: Epoch, guess_word: str) -> None:
         post_line2.set_text("")
         return _finalize_guess_label(ep)
 
-    # Two-line wrap: find the rightmost split that keeps line 1 within bounds.
     for split in range(len(post_tokens), -1, -1):
         line2_tokens = post_tokens[split:]
-        if line2_tokens == ["."]:   # keep period glued to previous word
+        if line2_tokens == ["."]:
             continue
         line1_post = stitch(post_tokens[:split])
         post_text.set_text(line1_post)
@@ -454,6 +567,78 @@ def draw_sentence(ep: Epoch, guess_word: str) -> None:
     post_line2.set_position((LEFT, LINE2_Y))
     return _finalize_guess_label(ep)
 
+# ── game-show helpers ─────────────────────────────────────────────────────
+def _gs_reveal_string(ep: Epoch, reveal_count: int) -> str:
+    """Build the WoF-style sentence: revealed tokens shown, others as underscores."""
+    ctx_used = 0
+    parts = []
+    for i, tok in enumerate(ep.tokens):
+        if i == ep.mask_idx:
+            parts.append("[?]")
+        else:
+            parts.append(tok if ctx_used < reveal_count else "_" * len(tok))
+            ctx_used += 1
+    # Re-join respecting punctuation
+    out = ""
+    for p in parts:
+        if p in (".", ","):
+            out = out.rstrip() + p + " "
+        else:
+            out += p + " "
+    return out.strip()
+
+def draw_gameshow_sentence(ep: Epoch, phase_frac: float) -> None:
+    n_ctx        = sum(1 for i in range(len(ep.tokens)) if i != ep.mask_idx)
+    reveal_count = min(int(phase_frac * (n_ctx + 1)), n_ctx)
+    gs_sentence.set_text(_gs_reveal_string(ep, reveal_count))
+
+def draw_bar_chart(epoch_idx: int, ep: Epoch, phase_frac: float) -> None:
+    snapshots = EPOCH_BARS[epoch_idx]
+    n         = len(snapshots)
+
+    # Interpolate between adjacent snapshots
+    pos    = phase_frac * (n - 1)
+    lo     = max(0, min(int(pos), n - 2))
+    hi     = lo + 1
+    t      = pos - lo
+
+    snap_lo = snapshots[lo]
+    snap_hi = snapshots[hi]
+
+    guess       = ep.guess
+    guess_clust = _CLUSTER_BY_WORD.get(guess)
+    win_color   = CLUSTER_COLORS[guess_clust.id] if guess_clust else ACCENT
+
+    for slot in range(5):
+        word, prob_lo = snap_lo[slot]
+        _,    prob_hi = snap_hi[slot]
+        prob    = interp(prob_lo, prob_hi, t)
+        is_win  = (word == guess)
+
+        _bar_rects[slot].set_width(prob * _BAR_MAX_W)
+        _bar_rects[slot].set_facecolor(win_color if is_win else BAR_DIM)
+        color = TEXT if is_win else TEXT_MUTE
+        _bar_words[slot].set_text(word)
+        _bar_words[slot].set_color(color)
+        _bar_vals[slot].set_text(f"{prob:.0%}")
+        _bar_vals[slot].set_color(color)
+
+# ── panel-visibility helpers ──────────────────────────────────────────────
+def _show_embed_panel(v: bool) -> None:
+    sent_title.set_visible(v)
+    sentence_text.set_visible(v)
+    chip_bg.set_visible(v)
+    chip_text.set_visible(v)
+    post_text.set_visible(v)
+    post_line2.set_visible(v)
+    guess_text.set_visible(v)
+
+def _show_gameshow_panel(v: bool) -> None:
+    gs_sublabel.set_visible(v)
+    gs_sentence.set_visible(v)
+    gs_mask_word.set_visible(v)
+
+# ── embedding-space update helpers ────────────────────────────────────────
 def update_dots_for_global_t(g_t: float) -> None:
     eased   = ease_in_out(g_t)
     offsets = []
@@ -471,12 +656,12 @@ def update_dots_for_global_t(g_t: float) -> None:
     for label in cluster_labels_on_map:
         label.set_alpha(0.75 * halo_strength)
 
-def update_star_for_epoch(ep: Epoch, g_t: float) -> None:
+def update_star_for_epoch(ep: Epoch, g_t: float, scale: float = 1.0) -> None:
     target = next(p for p in all_points if p["word"] == ep.truth)
     eased  = ease_in_out(g_t)
     x = interp(target["start"][0], target["end"][0], eased)
     y = interp(target["start"][1], target["end"][1], eased)
-    star.set_xy(star_vertices(x, y, 0.26, 0.11))
+    star.set_xy(star_vertices(x, y, 0.26 * scale, 0.11 * scale))
 
 def narration_for(ep: Epoch, epoch_idx: int) -> str:
     if ep.is_bench:
@@ -495,24 +680,58 @@ def narration_for(ep: Epoch, epoch_idx: int) -> str:
             "BERT must predict it from context.\n"
             "Gradients nudge the geometry toward truth.")
 
-# ---------- animation update ----------
+# ── main animation update ─────────────────────────────────────────────────
 def update(frame: int):
-    epoch_idx, _alpha, g_t, phase = frame_to_state(frame)
+    epoch_idx, phase_frac, g_t, phase = frame_to_state(frame)
     ep = EPOCHS[epoch_idx]
 
-    draw_sentence(ep, ep.guess)
+    # Always update dots and pill
     update_dots_for_global_t(g_t)
-    update_star_for_epoch(ep, g_t)
 
     pill_text.set_text(f"Epoch {ep.epoch}")
     pill_patch.set_facecolor(MASK_BG if ep.is_bench else PANEL_LT)
     pill_patch.set_edgecolor(ACCENT  if ep.is_bench else BORDER)
     pill_text.set_color(ACCENT       if ep.is_bench else TEXT_MUTE)
 
-    narr_text.set_text(narration_for(ep, epoch_idx))
+    if phase == "gameshow":
+        # ── Phase 1: context clues light up, bar chart narrows ────────────
+        update_star_for_epoch(ep, g_t)  # star at normal size
+
+        _show_embed_panel(False)
+        _show_gameshow_panel(True)
+        narr_ax.set_visible(False)
+        ax_bar.set_visible(True)
+
+        draw_gameshow_sentence(ep, phase_frac)
+        draw_bar_chart(epoch_idx, ep, phase_frac)
+
+    elif phase == "embed":
+        # ── Phase 2: cut to embedding space; star pulses on winner ────────
+        pulse = 1.0 + 0.55 * math.sin(phase_frac * math.pi)
+        update_star_for_epoch(ep, g_t, scale=pulse)
+
+        _show_embed_panel(True)
+        _show_gameshow_panel(False)
+        narr_ax.set_visible(True)
+        ax_bar.set_visible(False)
+
+        draw_sentence(ep, ep.guess)
+        narr_text.set_text(narration_for(ep, epoch_idx))
+
+    else:  # transition — dots migrate, keep embed layout
+        update_star_for_epoch(ep, g_t)
+
+        _show_embed_panel(True)
+        _show_gameshow_panel(False)
+        narr_ax.set_visible(True)
+        ax_bar.set_visible(False)
+
+        draw_sentence(ep, ep.guess)
+        narr_text.set_text(narration_for(ep, epoch_idx))
+
     return []
 
-# ---------- render ----------
+# ── render ────────────────────────────────────────────────────────────────
 class TqdmWriter(animation.FFMpegWriter):
     def __init__(self, *args, frames: int = None, **kwargs):
         super().__init__(*args, **kwargs)
