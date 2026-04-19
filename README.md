@@ -2,7 +2,7 @@
 
 An animated visualization of how BERT-style masked language modeling works. Word embeddings start scattered at random and migrate into semantic clusters as training progresses — showing, visually, how the model learns that "milk" and "juice" belong together.
 
-<video src="bert_training.mp4" controls width="100%"></video>
+[bert_training.mp4](bert_training.mp4)
 
 ## What it shows
 
